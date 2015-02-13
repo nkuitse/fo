@@ -1,0 +1,273 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename qw(basename dirname);
+use File::Copy qw(copy move);
+use Data::Floid;
+use Graphics::Magick qw();
+use Image::ExifTool qw();
+use POSIX qw(strftime);
+
+use constant MINDATE => '19700101';
+# use constant DEBUG => 0;
+
+# *move = *copy if DEBUG;
+
+sub usage;
+
+my %dir;
+my %key2code = qw(
+    created  C
+    imported I
+    file     F
+    rotate   R
+);
+my %code2key = reverse %key2code;
+my %config = (
+    preview_dimens => [ 640, 480 ],
+);
+
+usage if !@ARGV;
+
+init();
+run_command();
+
+# --- Command handlers
+
+sub cmd_check {
+    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+        if !@ARGV;
+    my $db = db('r');
+    my $err = 0;
+    foreach my $f (@ARGV) {
+        # Check to see if it's already been imported
+        my $hash = hash($f);
+        my $fid = $db->uget($hash);
+        if (defined $fid) {
+            print STDERR "* $fid $f\n";
+            $err++;
+        }
+        else {
+            print STDERR "- $f\n";
+        }
+    }
+    exit $err ? 2 : 0;
+}
+
+sub cmd_import {
+    my $db = db('rw');
+    # if (DEBUG) {
+    #     delete $db->{'index'}{$_} for keys %{ $db->{'index'} };
+    #     $db->{'index'}{'-%N5d'} = '09310';
+    # }
+    my $exif = exif();
+    my $today = strftime('%Y%m%d', localtime);
+    open my $log, '>>', mkfile('log', 'import.log')
+        or die "Can't open import log: $!";
+    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+        if !@ARGV;
+    foreach my $f (@ARGV) {
+        # Check to see if it's already been imported
+        my $hash = hash($f);
+        my $fid = $db->uget($hash);
+        if (defined $fid) {
+            print STDERR "- $fid $hash $f :: already present\n";
+            next;
+        }
+        # Read image data and metadata
+        my $magick = magick($f);
+        my ($w, $h) = $magick->Get('width', 'height');
+        $exif->ExtractInfo($f);
+        my ($date, $y, $m, $d) = date($exif);
+        my $rot = exif_rotate($exif);
+        # Get the photo ID and record the hash
+        $fid = $db->mint('%N5d', mkmeta(
+            'created' => $date,
+            'imported' => $today,
+            'file' => $f,
+            'rotate' => $rot,
+        ));
+        $db->uset($hash => "$fid master");
+        # Write the derived preview
+        my ($pw, $ph) = @{ $config{'preview_dimens'} };
+        ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
+        render($magick, mkfile($y, $m, $d, "$fid.jpg"),
+            'strip' => 1,
+            'width' => $pw,
+            'height' => $ph,
+            'rotate' => $rot,
+        );
+        # Write the master
+        my $pfx = prefix($fid);
+        my $mdir = mkpath('masters', $pfx);
+        my $mfile = mkfile($mdir, "$fid.jpg");
+        mkcopy($f, $mfile, 0444);
+        # Log it
+        print $log "$today $fid $hash $f\n";
+        print STDERR "+ $fid $hash $y $m $d $f\n";
+    }
+}
+
+sub prefix { substr(shift, 0, 3) }
+
+sub master {
+    my ($fid) = @_;
+    my $pfx = prefix($fid);
+    return "masters/$pfx/$fid.jpg";
+}
+
+sub cmd_render {
+    my ($size);
+    GetOptions(
+        's|size=s' => \$size,
+    ) or usage;
+    $size = size($size);
+    my ($pw, $ph);
+    die "Not yet implemented";
+    usage if !@ARGV;
+    expand(@ARGV);
+    foreach my $fid (@ARGV) {
+        my $pfx = prefix($fid);
+        my $mfile  = master($fid);
+        my $magick = magick($mfile);
+        my $rot = rotate($fid);
+        render($magick, mkfile('derived', $size, $pfx),
+            'strip' => 1,
+            'width' => $pw,
+            'height' => $ph,
+            'rotate' => $rot,
+        );
+    }
+}
+
+# --- Other functions
+
+sub mkmeta {
+    my %meta = @_;
+    return join("\n", map { join(':', $key2code{$_}, $meta{$_}) } sort keys %meta);
+}
+
+sub render {
+    my ($magick, $f, %arg) = @_;
+    $magick->Profile if $arg{'strip'};
+    $magick->Rotate('degrees' => $arg{'rotate'}) if $arg{'rotate'};
+    $magick->Scale('width' => $arg{'width'}, 'height' => $arg{'height'});
+    $magick->Write($f);
+}
+
+sub init {
+    chdir($ENV{'PHOTOS'} || glob('~/photos'));
+    use_plugins();
+    read_config();
+}
+
+sub db {
+    my ($mode) = @_;
+    return Data::Floid->new(
+        'dbm' => 'DB_File',
+        'path' => 'db/photos.db',
+        'mode' => $mode,
+    );
+}
+
+sub run_command {
+    &{ __PACKAGE__->can('cmd_' . shift @ARGV) or usage };
+}
+
+sub mkfile {
+    my $name = pop;
+    mkpath(@_) . '/' . $name;
+}
+
+sub mkpath {
+    my $path = shift;
+    my @paths = ( $path );
+    foreach (@_) {
+        push @paths, $path .= '/' . $_;
+    }
+    foreach my $d (@paths) {
+        $dir{$d}++
+            or -d $d
+            or mkdir $d
+            or die "Can't mkdir $d: $!";
+    }
+    pop @paths;
+}
+
+sub mkcopy {
+    my ($fa, $fb, $mode) = @_;
+    move($fa, $fb) or copy($fa, $fb) or die "Can't copy $fa to $fb: $!";
+    chmod($mode, $fb) if defined $mode;
+    return $fb;
+}
+
+sub hash {
+    my ($f) = @_;
+    open my $fh, '<', $f or die "Can't open file $f for reading: $!";
+    my $digest = Digest->new('SHA-1');
+    $digest->addfile($fh);
+    return $digest->hexdigest;
+}
+
+sub exif {
+    my $exif = Image::ExifTool->new;
+    $exif->Options('DateFormat' => '%Y-%m-%d', 'StrictDate' => 1);
+    return $exif;
+}
+
+sub magick {
+    my ($f) = @_;
+    my $magick = Graphics::Magick->new;
+    $magick->Read($f);
+    return $magick;
+}
+
+sub exif_rotate {
+    my ($exif) = @_;
+    my $orient = $exif->GetValue('Orientation', 'ValueConv');
+    $exif->SetNewValue('Orientation#' => 1)
+        if !defined $orient || $orient != 1;
+    return +90 if $orient == 6;
+    return -90 if $orient == 8;
+    return 180 if $orient == 3;
+    return 0;
+}
+
+sub date {
+    my ($exif) = @_;
+    my @date;
+    foreach (qw(CreateDate DateTimeOriginal FileModifyDate)) {
+        @date = parse_date($exif->GetValue($_));
+        if ($date[0] ne '19700101') {
+            return wantarray ? @date : $date[0];
+        }
+    }
+    return wantarray ? @date[0..3] : $date[0];
+}
+
+sub parse_date {
+    my ($date) = @_;
+    return qw(19700101 1970 01 01) if !defined $date;
+    if ($date =~ /^(\d\d\d\d)[-:.]?(\d\d)[-:.]?(\d\d)/) {
+        $date = "$1$2$3";
+        return ($date, $1, $2, $3) if $date ge MINDATE;
+    }
+    return MINDATE, substr(MINDATE,0,4), substr(MINDATE,4,2), substr(MINDATE,6,2);
+}
+
+sub use_plugins {
+    foreach my $f (grep { -x && -f _ } glob('lib/f4*.pl')) {
+        if (!do $f) {
+            my $err = $@ || $! || 'false return value';
+            die "Can't use plugin $_: $err\n";
+        }
+    }
+}
+
+sub read_config {
+    ;
+}
+
+
