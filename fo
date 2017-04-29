@@ -1,0 +1,391 @@
+#!/usr/bin/perl
+
+use strict;
+use warnings;
+
+use File::Basename qw(basename dirname);
+use File::Copy qw(copy move);
+use Data::Floid;
+use Graphics::Magick qw();
+use Image::ExifTool qw();
+use POSIX qw(strftime);
+use Digest;
+use Getopt::Long
+    qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
+
+use constant MINDATE => '19700101';
+# use constant DEBUG => 0;
+
+# *move = *copy if DEBUG;
+
+sub usage;
+sub fatal;
+
+my %dir;
+my %key2code = qw(
+    created  C
+    imported I
+    file     F
+    rotate   R
+);
+my %code2key = reverse %key2code;
+my %config = (
+    'preview-size' => [480, 480],
+    'root' => ($ENV{'PHOTOS'} || glob('~/photos')),
+);
+
+usage if !@ARGV;
+
+init();
+run_command();
+
+# --- Command handlers
+
+sub cmd_check {
+    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+        if !@ARGV;
+    my $db = db('rw');
+    my $err = 0;
+    my %hash2fid;
+    foreach my $f (@ARGV) {
+        # Check to see if it's already been imported
+        my $hash = hash($f);
+        my $fid = eval { $db->uget($hash) };
+        my $master = master($hash);
+        if (defined $fid) {
+            print STDERR "+ $fid $f\n";
+            $err++;
+        }
+        elsif (-e $master) {
+            if (!keys %hash2fid) {
+                open my $fh, '<', 'photos.list' or fatal "open photos.list: $!";
+                while (<$fh>) {
+                    $hash2fid{$2} = $1 if /^(\d+) (\S+)$/;
+                }
+            }
+            $fid = $hash2fid{$hash};
+            if (defined $fid) {
+                eval { $db->uset($hash, $fid) };
+                print STDERR "* $fid $f\n";
+            }
+            else {
+                print STDERR "E $f : master $master not in photos.list\n";
+            }
+            $err++;
+        }
+        else {
+            print STDERR "- $f\n";
+        }
+    }
+    exit $err ? 2 : 0;
+}
+
+sub cmd_import {
+    my $db = db('rw');
+    # if (DEBUG) {
+    #     delete $db->{'index'}{$_} for keys %{ $db->{'index'} };
+    #     $db->{'index'}{'-%N5d'} = '09310';
+    # }
+    my $exif = exif();
+    my $today = strftime('%Y%m%d', localtime);
+    open my $log, '>>', mkfile('log', 'import.log')
+        or die "Can't open import log: $!";
+    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+        if !@ARGV;
+    foreach my $f (@ARGV) {
+        # Check to see if it's already been imported
+        my $hash = hash($f);
+        my $fid = eval { $db->get($hash) };
+        if (defined $fid) {
+            print STDERR "- $fid $hash $f :: already present\n";
+            next;
+        }
+        # Get the photo ID and record the hash
+        $exif->ExtractInfo($f);
+        my ($date, $y, $m, $d) = date($exif);
+        my $rot = exif_rotate($exif);
+        $fid = $db->mint('%N5d', mkmeta(
+            'created' => $date,
+            'imported' => $today,
+            'file' => $f,
+            'rotate' => $rot,
+        ));
+        $db->uset($hash => $fid);
+        # Write the master
+        my $master = mkfile('masters', prefix($hash), "$hash.jpg");
+        mkcopy($f, $master, 0444);
+        # Write the derived preview
+        create_preview(
+            $master,
+            mkpreview($y, $m, $d, $fid),
+            'fid' => $fid,
+            'rotate' => $rot,
+            'master' => $hash,
+        );
+        # Log it
+        print $log "$today $fid $hash $f\n";
+        print STDERR "+ $fid $hash $y $m $d $f\n";
+    }
+}
+
+sub cmd_thumb {
+    my ($force, $check, $verbose, $rotation);
+    GetOptions(
+        'f|force' => \$force,
+        'k|check' => \$check,
+        'v|verbose' => \$verbose,
+        'r|rotation=s' => \$rotation,
+    ) or usage;
+    usage if $check && $force;
+    my $exif = exif();
+    my $db = db('r');
+    open my $log, '+>>', mkfile('log', 'thumb.log')
+        or die "Can't open thumb log: $!";
+    my %thumb;
+    seek $log, 0, 0;  # For reading
+    while (<$log>) {
+        my ($fid, $file) = ( /^(\d+) (\S+)/ );
+        $thumb{$fid} = $file;
+    }
+    seek $log, 0, 0;  # Reset EOF
+    foreach my $fid (@ARGV) {
+        my $hash = eval { $db->get($fid) };
+        my $thumb = $thumb{$fid};
+        if ($thumb && -e $thumb && !$force) {
+            if ($check) {
+                print $fid, ' ' if $verbose;
+                print $thumb, "\n";
+                $check++;
+            }
+            else {
+                print STDERR "- $fid : thumb already exists\n";
+            }
+            next;
+        }
+        if (!defined $hash) {
+            print STDERR "E $fid : unknown fid\n";
+            next;
+        }
+        my $src = master($hash);
+        if (!-e $src) {
+            print STDERR "E $fid : no master\n";
+            next;
+        }
+        $exif->ExtractInfo($src);
+        my ($date, $y, $m, $d) = date($exif);
+        my $rot = $rotation || exif_rotate($exif) || 0;
+        my ($pw, $ph) = @{ $config{'preview-size'} };
+        ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
+        my $dst = mkpreview($y, $m, $d, $fid);
+        if ($thumb && $thumb ne $dst && -e $thumb) {
+            unlink $thumb;
+            print STDERR "D $fid $thumb\n";
+        }
+        if (-e $dst) {
+            if (!$force) {
+                print STDERR "- $fid $dst\n";
+                next;
+            }
+            print STDERR "* $fid $dst\n";
+        }
+        create_preview(
+            $src,
+            $dst,
+            'fid' => $fid,
+            'rotate' => $rot,
+            'master' => $hash,
+        );
+        print $log "$fid $dst\n";
+        print STDERR "+ $fid $dst\n" if $verbose;
+    }
+    if ($check) {
+        exit 0 if $check > @ARGV;
+        fatal "some not found" if $verbose;
+        exit 2;
+    }
+}
+
+sub cmd_render {
+    my ($size, $rotation);
+    GetOptions(
+        's|size=s' => \$size,
+        'r|rotation=s' => \$rotation,
+    ) or usage;
+    $size = size($size);
+    my ($pw, $ph);
+    die "Not yet implemented";
+    usage if !@ARGV;
+    expand(@ARGV);
+    foreach my $fid (@ARGV) {
+        my $master = master($fid);
+        my $magick = magick($master);
+        render($magick, mkfile('derived', $size, prefix($fid)),
+            'strip' => 1,
+            'width' => $pw,
+            'height' => $ph,
+            'rotate' => $rotation,
+        );
+    }
+}
+
+# --- Other functions
+
+sub mkpreview {
+    my ($y, $m, $d, $fid) = @_;
+    return mkfile('all', "$y-$m", "$d-$fid.jpg"),
+}
+
+sub create_preview {
+    my ($src, $dst, %arg) = @_;
+    my ($pw, $ph) = @{ $config{'preview-size'} };
+    my $rot = $arg{'rotate'} || 0;
+    ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
+    my $magick = magick($src);
+    # my ($w, $h) = $magick->Get('width', 'height');
+    render($magick, $dst,
+        'strip' => 1,
+        'width' => $pw,
+        'height' => $ph,
+        %arg,
+    );
+}
+
+sub prefix { substr(shift, 0, 2) }
+
+sub master {
+    my ($fid) = @_;
+    my $pfx = prefix($fid);
+    return "masters/$pfx/$fid.jpg";
+}
+
+sub mkmeta {
+    my %meta = @_;
+    return join("\n", map { join(':', $key2code{$_}, $meta{$_}) } sort keys %meta);
+}
+
+sub render {
+    my ($magick, $f, %arg) = @_;
+    my $geom;
+    $geom = join('x', @arg{qw(width height)}) if defined $arg{'width'} && defined $arg{'height'};
+    $magick->Profile if $arg{'strip'};
+    $magick->Rotate('degrees' => $arg{'rotate'}) if $arg{'rotate'};
+    $magick->Scale('geometry' => $geom) if defined $geom;
+    $magick->Write($f);
+}
+
+sub init {
+    fatal "can't determine root" if !defined $config{root};
+    chdir($config{root}) or fatal "chdir $config{root}: $!";
+    read_config();
+    use_plugins();
+}
+
+sub db {
+    my ($mode) = @_;
+    return Data::Floid->new(
+        'dbm' => 'DB_File',
+        'path' => 'db/photos.db',
+        'mode' => $mode,
+    );
+}
+
+sub run_command {
+    &{ __PACKAGE__->can('cmd_' . shift @ARGV) or usage };
+}
+
+sub mkfile {
+    my $name = pop;
+    mkpath(@_) . '/' . $name;
+}
+
+sub mkpath {
+    my $path = shift;
+    my @paths = ( $path );
+    foreach (@_) {
+        push @paths, $path .= '/' . $_;
+    }
+    foreach my $d (@paths) {
+        $dir{$d}++
+            or -d $d
+            or mkdir $d
+            or die "Can't mkdir $d: $!";
+    }
+    pop @paths;
+}
+
+sub mkcopy {
+    my ($fa, $fb, $mode) = @_;
+    move($fa, $fb) or copy($fa, $fb) or die "Can't copy $fa to $fb: $!";
+    chmod($mode, $fb) if defined $mode;
+    return $fb;
+}
+
+sub hash {
+    my ($f) = @_;
+    open my $fh, '<', $f or die "Can't open file $f for reading: $!";
+    my $digest = Digest->new('MD5');
+    $digest->addfile($fh);
+    return $digest->hexdigest;
+}
+
+sub exif {
+    my $exif = Image::ExifTool->new;
+    $exif->Options('DateFormat' => '%Y-%m-%d', 'StrictDate' => 1);
+    return $exif;
+}
+
+sub magick {
+    my ($f) = @_;
+    my $magick = Graphics::Magick->new;
+    $magick->Read($f);
+    return $magick;
+}
+
+sub exif_rotate {
+    my ($exif) = @_;
+    my $orient = $exif->GetValue('Orientation', 'ValueConv');
+    $exif->SetNewValue('Orientation#' => 1)
+        if !defined $orient || $orient != 1;
+    return if !defined $orient;
+    return +90 if $orient == 6;
+    return -90 if $orient == 8;
+    return 180 if $orient == 3;
+    return 0;
+}
+
+sub date {
+    my ($exif) = @_;
+    my @date;
+    foreach (qw(CreateDate DateTimeOriginal FileModifyDate)) {
+        @date = parse_date($exif->GetValue($_));
+        if ($date[0] ne '19700101') {
+            return wantarray ? @date : $date[0];
+        }
+    }
+    return wantarray ? @date[0..3] : $date[0];
+}
+
+sub parse_date {
+    my ($date) = @_;
+    return qw(19700101 1970 01 01) if !defined $date;
+    if ($date =~ /^(\d\d\d\d)[-:.]?(\d\d)[-:.]?(\d\d)/) {
+        $date = "$1$2$3";
+        return ($date, $1, $2, $3) if $date ge MINDATE;
+    }
+    return MINDATE, substr(MINDATE,0,4), substr(MINDATE,4,2), substr(MINDATE,6,2);
+}
+
+sub use_plugins {
+    foreach my $f (grep { -x && -f _ } glob('lib/f4*.pl')) {
+        if (!do $f) {
+            my $err = $@ || $! || 'false return value';
+            die "Can't use plugin $_: $err\n";
+        }
+    }
+}
+
+sub read_config {
+    ;
+}
+
+
