@@ -51,10 +51,11 @@ sub cmd_view {
     usage if !@ARGV;
     my $db = db('r');
     my @cmd = shellwords($config{'viewer'});
-    my $thumbs;
+    my ($thumbs, $masters);
     foreach my $fid (@ARGV) {
         if ($view_master) {
-            my $hash = eval { $db->get($fid) };
+            $masters ||= read_master_list();
+            my $hash = $masters->{$fid};
             fatal "no such photo: $fid" if !defined $hash;
             push @cmd, master($hash);
         }
@@ -73,7 +74,7 @@ sub cmd_check {
         if !@ARGV;
     my $db = db('rw');
     my $err = 0;
-    my %hash2fid;
+    my $hashes;
     foreach my $f (@ARGV) {
         # Check to see if it's already been imported
         my $hash = hash($f);
@@ -84,19 +85,16 @@ sub cmd_check {
             $err++;
         }
         elsif (-e $master) {
-            if (!keys %hash2fid) {
-                open my $fh, '<', 'photos.list' or fatal "open photos.list: $!";
-                while (<$fh>) {
-                    $hash2fid{$2} = $1 if /^(\d+) (\S+)$/;
-                }
+            if (!$hashes) {
+                $hashes = { reverse read_master_list() };
             }
-            $fid = $hash2fid{$hash};
+            $fid = $hashes->{$hash};
             if (defined $fid) {
                 eval { $db->uset($hash, $fid) };
                 print STDERR "* $fid $f\n";
             }
             else {
-                print STDERR "E $f : master $master not in photos.list\n";
+                print STDERR "E $f : master $master not in masters.list\n";
             }
             $err++;
         }
@@ -155,9 +153,21 @@ sub cmd_import {
     }
 }
 
+sub read_master_list {
+    open my $list, '<', 'masters.list'
+        or fatal "open masters.list: $!";
+    my %photo;
+    while (<$list>) {
+        my ($fid, $hash) = ( /^(\d+) (\S+)/ );
+        $photo{$fid} = $hash;
+    }
+    close $list;
+    return \%photo;
+}
+
 sub read_thumb_list {
-    open my $log, '<', mkfile('log', 'thumb.log')
-        or fatal "open log/thumnb.log: $!";
+    open my $log, '<', 'thumbs.list'
+        or fatal "open thumbs.list: $!";
     my %thumb;
     while (<$log>) {
         my ($fid, $file) = ( /^(\d+) (\S+)/ );
@@ -179,9 +189,14 @@ sub cmd_thumb {
     my $exif = exif();
     my $db = db('r');
     my $thumbs = read_thumb_list();
-    my $log;
+    my $masters = read_master_list();
+    my $list;
     foreach my $fid (@ARGV) {
-        my $hash = eval { $db->get($fid) };
+        my $hash = $masters->{$fid};
+        if (!defined $hash) {
+            print STDERR "E $fid : unknown fid\n";
+            next;
+        }
         my $thumb = $thumbs->{$fid};
         if ($thumb && -e $thumb && !$force) {
             if ($check) {
@@ -192,10 +207,6 @@ sub cmd_thumb {
             else {
                 print STDERR "- $fid : thumb already exists\n";
             }
-            next;
-        }
-        if (!defined $hash) {
-            print STDERR "E $fid : unknown fid\n";
             next;
         }
         my $src = master($hash);
@@ -227,11 +238,11 @@ sub cmd_thumb {
             'rotate' => $rot,
             'master' => $hash,
         );
-        if (!$log) {
-            open $log, '>>', mkfile('log', 'thumb.log')
-                or die "Can't open thumb log: $!";
+        if (!$list) {
+            open $list, '>>', 'thumbs.list'
+                or die "Can't open thumb list: $!";
         }
-        print $log "$fid $dst\n";
+        print $list "$fid $dst\n";
         print STDERR "+ $fid $dst\n" if $verbose;
     }
     if ($check) {
