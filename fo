@@ -10,6 +10,7 @@ use Graphics::Magick qw();
 use Image::ExifTool qw();
 use POSIX qw(strftime);
 use Digest;
+use Text::ParseWords qw(shellwords);
 use Getopt::Long
     qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
 
@@ -32,6 +33,7 @@ my %code2key = reverse %key2code;
 my %config = (
     'preview-size' => [480, 480],
     'root' => ($ENV{'PHOTOS'} || glob('~/photos')),
+    'viewer' => 'sxiv',
 );
 
 usage if !@ARGV;
@@ -40,6 +42,31 @@ init();
 run_command();
 
 # --- Command handlers
+
+sub cmd_view {
+    my ($view_master);
+    GetOptions(
+        'm|master' => \$view_master,
+    ) or usage;
+    usage if !@ARGV;
+    my $db = db('r');
+    my @cmd = shellwords($config{'viewer'});
+    my $thumbs;
+    foreach my $fid (@ARGV) {
+        if ($view_master) {
+            my $hash = eval { $db->get($fid) };
+            fatal "no such photo: $fid" if !defined $hash;
+            push @cmd, master($hash);
+        }
+        else {
+            $thumbs ||= read_thumb_list();
+            my $thumb = $thumbs->{$fid}
+                or fatal "no thumbnail for $fid";
+            push @cmd, $thumb;
+        }
+    }
+    system(@cmd) == 0 or fatal "$cmd[0] failed: $!";
+}
 
 sub cmd_check {
     @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
@@ -128,6 +155,18 @@ sub cmd_import {
     }
 }
 
+sub read_thumb_list {
+    open my $log, '<', mkfile('log', 'thumb.log')
+        or fatal "open log/thumnb.log: $!";
+    my %thumb;
+    while (<$log>) {
+        my ($fid, $file) = ( /^(\d+) (\S+)/ );
+        $thumb{$fid} = $file;
+    }
+    close $log;
+    return \%thumb;
+}
+
 sub cmd_thumb {
     my ($force, $check, $verbose, $rotation);
     GetOptions(
@@ -139,18 +178,11 @@ sub cmd_thumb {
     usage if $check && $force;
     my $exif = exif();
     my $db = db('r');
-    open my $log, '+>>', mkfile('log', 'thumb.log')
-        or die "Can't open thumb log: $!";
-    my %thumb;
-    seek $log, 0, 0;  # For reading
-    while (<$log>) {
-        my ($fid, $file) = ( /^(\d+) (\S+)/ );
-        $thumb{$fid} = $file;
-    }
-    seek $log, 0, 0;  # Reset EOF
+    my $thumbs = read_thumb_list();
+    my $log;
     foreach my $fid (@ARGV) {
         my $hash = eval { $db->get($fid) };
-        my $thumb = $thumb{$fid};
+        my $thumb = $thumbs->{$fid};
         if ($thumb && -e $thumb && !$force) {
             if ($check) {
                 print $fid, ' ' if $verbose;
@@ -195,6 +227,10 @@ sub cmd_thumb {
             'rotate' => $rot,
             'master' => $hash,
         );
+        if (!$log) {
+            open $log, '>>', mkfile('log', 'thumb.log')
+                or die "Can't open thumb log: $!";
+        }
         print $log "$fid $dst\n";
         print STDERR "+ $fid $dst\n" if $verbose;
     }
@@ -274,10 +310,10 @@ sub render {
 }
 
 sub init {
-    fatal "can't determine root" if !defined $config{root};
-    chdir($config{root}) or fatal "chdir $config{root}: $!";
     read_config();
     use_plugins();
+    fatal "can't determine root" if !defined $config{root};
+    chdir($config{root}) or fatal "chdir $config{root}: $!";
 }
 
 sub db {
@@ -385,7 +421,15 @@ sub use_plugins {
 }
 
 sub read_config {
-    ;
+    my ($config_file) = map { glob($_) } qw(~/etc/fo/fo.conf ~/.config/fo/fo.conf ~/.forc);
+    return if !defined $config_file || !-e $config_file;
+    open my $fh, '<', $config_file or fatal "open $config_file: $!";
+    while (<$fh>) {
+        next if /^\s*(#.*)?$/;  # Skip blank lines and comments
+        $config{$1} = $2, next if /^\s*(\S+)\s+(.*)$/;
+        chomp;
+        fatal "unrecognized config setting in $config_file: $_";
+    }
 }
 
 
