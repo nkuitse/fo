@@ -286,7 +286,7 @@ sub cmd_render {
 
 sub mkpreview {
     my ($y, $m, $d, $fid) = @_;
-    return mkfile('all', "$y-$m", "$d-$fid.jpg"),
+    return mkfile('preview', "$y-$m", "$d-$fid.jpg"),
 }
 
 sub create_preview {
