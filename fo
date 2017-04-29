@@ -115,6 +115,10 @@ sub cmd_import {
     my $today = strftime('%Y%m%d', localtime);
     open my $log, '>>', mkfile('log', 'import.log')
         or die "Can't open import log: $!";
+    open my $list, '>>', 'masters.list'
+        or die "Can't open masters.list: $!";
+    open my $thlist, '>>', 'thumbs.list'
+        or die "Can't open thumb list: $!";
     @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
         if !@ARGV;
     foreach my $f (@ARGV) {
@@ -139,14 +143,17 @@ sub cmd_import {
         # Write the master
         my $master = mkfile('masters', prefix($hash), "$hash.jpg");
         mkcopy($f, $master, 0444);
+        print $list "$fid $hash\n";
         # Write the derived preview
+        my $dst = mkpreview($y, $m, $d, $fid);
         create_preview(
             $master,
-            mkpreview($y, $m, $d, $fid),
+            $dst,
             'fid' => $fid,
             'rotate' => $rot,
             'master' => $hash,
         );
+        print $list "$fid $dst\n";
         # Log it
         print $log "$today $fid $hash $f\n";
         print STDERR "+ $fid $hash $y $m $d $f\n";
