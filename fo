@@ -11,6 +11,7 @@ use Image::ExifTool qw();
 use POSIX qw(strftime);
 use Digest;
 use Text::ParseWords qw(shellwords);
+use DBI;
 use Getopt::Long
     qw(:config posix_default gnu_compat require_order bundling no_ignore_case);
 
@@ -38,6 +39,10 @@ my %config = (
 
 usage if !@ARGV;
 
+my $dbfile = 'db/photos.sqlite3';
+my ($dbh, %sth);
+my $digest = Digest->new('MD5');
+
 init();
 run_command();
 
@@ -51,19 +56,19 @@ sub cmd_view {
     usage if !@ARGV;
     my $db = db('r');
     my @cmd = shellwords($config{'viewer'});
-    my ($thumbs, $masters);
+    my ($previews, $masters);
     foreach my $fid (@ARGV) {
         if ($view_master) {
             $masters ||= read_master_list();
-            my $hash = $masters->{$fid};
-            fatal "no such photo: $fid" if !defined $hash;
-            push @cmd, master($hash);
+            my $md5 = $masters->{$fid};
+            fatal "no such photo: $fid" if !defined $md5;
+            push @cmd, master($md5);
         }
         else {
-            $thumbs ||= read_thumb_list();
-            my $thumb = $thumbs->{$fid}
-                or fatal "no thumbnail for $fid";
-            push @cmd, $thumb;
+            $previews ||= read_preview_list();
+            my $preview = $previews->{$fid}
+                or fatal "no preview for $fid";
+            push @cmd, $preview;
         }
     }
     system(@cmd) == 0 or fatal "$cmd[0] failed: $!";
@@ -74,23 +79,23 @@ sub cmd_check {
         if !@ARGV;
     my $db = db('rw');
     my $err = 0;
-    my $hashes;
+    my $md5s;
     foreach my $f (@ARGV) {
         # Check to see if it's already been imported
-        my $hash = hash($f);
-        my $fid = eval { $db->uget($hash) };
-        my $master = master($hash);
+        my $md5 = md5($f);
+        my $fid = eval { $db->uget($md5) };
+        my $master = master($md5);
         if (defined $fid) {
             print STDERR "+ $fid $f\n";
             $err++;
         }
         elsif (-e $master) {
-            if (!$hashes) {
-                $hashes = { reverse read_master_list() };
+            if (!$md5s) {
+                $md5s = { reverse read_master_list() };
             }
-            $fid = $hashes->{$hash};
+            $fid = $md5s->{$md5};
             if (defined $fid) {
-                eval { $db->uset($hash, $fid) };
+                eval { $db->uset($md5, $fid) };
                 print STDERR "* $fid $f\n";
             }
             else {
@@ -106,44 +111,47 @@ sub cmd_check {
 }
 
 sub cmd_import {
+    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+        if !@ARGV;
+    if (!@ARGV) {
+        print STDERR "nothing to import\n";
+        exit 0;
+    }
     my $db = db('rw');
-    # if (DEBUG) {
-    #     delete $db->{'index'}{$_} for keys %{ $db->{'index'} };
-    #     $db->{'index'}{'-%N5d'} = '09310';
-    # }
     my $exif = exif();
     my $today = strftime('%Y%m%d', localtime);
     open my $log, '>>', mkfile('log', 'import.log')
         or die "Can't open import log: $!";
     open my $list, '>>', 'masters.list'
         or die "Can't open masters.list: $!";
-    open my $thlist, '>>', 'thumbs.list'
-        or die "Can't open thumb list: $!";
-    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
-        if !@ARGV;
+    open my $thlist, '>>', 'preview.list'
+        or die "Can't open preview list: $!";
     foreach my $f (@ARGV) {
         # Check to see if it's already been imported
-        my $hash = hash($f);
-        my $fid = eval { $db->get($hash) };
+        my $md5 = md5($f);
+        my $fid = eval { $db->get($md5) };
         if (defined $fid) {
-            print STDERR "- $fid $hash $f :: already present\n";
+            print STDERR "- $fid $md5 $f :: already present\n";
             next;
         }
-        # Get the photo ID and record the hash
+        # Get the photo ID and record the MD5 hash
         $exif->ExtractInfo($f);
-        my ($date, $y, $m, $d) = date($exif);
         my $rot = exif_rotate($exif);
+        my ($date, $y, $m, $d, $H, $M, $S) = exif_date($exif);
+        my $ymd = $y.$m.$d;
         $fid = $db->mint('%N5d', mkmeta(
-            'created' => $date,
+            'created' => $ymd,
             'imported' => $today,
             'file' => $f,
             'rotate' => $rot,
         ));
-        $db->uset($hash => $fid);
+        $db->uset($md5 => $fid);
         # Write the master
-        my $master = mkfile('masters', prefix($hash), "$hash.jpg");
+        my $master = mkfile('masters', prefix($md5), "$md5.jpg");
         mkcopy($f, $master, 0444);
-        print $list "$fid $hash\n";
+        print $list "$fid $md5\n";
+        my $magick = magick($master);
+        my ($w, $h) = $magick->Get(qw(width height));
         # Write the derived preview
         my $dst = mkpreview($y, $m, $d, $fid);
         create_preview(
@@ -151,40 +159,26 @@ sub cmd_import {
             $dst,
             'fid' => $fid,
             'rotate' => $rot,
-            'master' => $hash,
+            'master' => $md5,
+            'magick' => $magick,
         );
         print $list "$fid $dst\n";
+        # Add to DB
+        insert(
+            'id' => $fid,
+            'md5' => $md5,
+            'taken' => $date,
+            'width' => $w,
+            'height' => $h,
+            'rotate' => $rot,
+        );
         # Log it
-        print $log "$today $fid $hash $f\n";
-        print STDERR "+ $fid $hash $y $m $d $f\n";
+        print $log "$today $fid $md5 $f\n";
+        print STDERR "+ $fid $md5 $y $m $d $f\n";
     }
 }
 
-sub read_master_list {
-    open my $list, '<', 'masters.list'
-        or fatal "open masters.list: $!";
-    my %photo;
-    while (<$list>) {
-        my ($fid, $hash) = ( /^(\d+) (\S+)/ );
-        $photo{$fid} = $hash;
-    }
-    close $list;
-    return \%photo;
-}
-
-sub read_thumb_list {
-    open my $log, '<', 'thumbs.list'
-        or fatal "open thumbs.list: $!";
-    my %thumb;
-    while (<$log>) {
-        my ($fid, $file) = ( /^(\d+) (\S+)/ );
-        $thumb{$fid} = $file;
-    }
-    close $log;
-    return \%thumb;
-}
-
-sub cmd_thumb {
+sub cmd_preview {
     my ($force, $check, $verbose, $rotation);
     GetOptions(
         'f|force' => \$force,
@@ -195,41 +189,41 @@ sub cmd_thumb {
     usage if $check && $force;
     my $exif = exif();
     my $db = db('r');
-    my $thumbs = read_thumb_list();
+    my $previews = read_preview_list();
     my $masters = read_master_list();
     my $list;
     foreach my $fid (@ARGV) {
-        my $hash = $masters->{$fid};
-        if (!defined $hash) {
+        my $md5 = $masters->{$fid};
+        if (!defined $md5) {
             print STDERR "E $fid : unknown fid\n";
             next;
         }
-        my $thumb = $thumbs->{$fid};
-        if ($thumb && -e $thumb && !$force) {
+        my $preview = $previews->{$fid};
+        if ($preview && -e $preview && !$force) {
             if ($check) {
                 print $fid, ' ' if $verbose;
-                print $thumb, "\n";
+                print $preview, "\n";
                 $check++;
             }
             else {
-                print STDERR "- $fid : thumb already exists\n";
+                print STDERR "- $fid : preview already exists\n";
             }
             next;
         }
-        my $src = master($hash);
+        my $src = master($md5);
         if (!-e $src) {
             print STDERR "E $fid : no master\n";
             next;
         }
         $exif->ExtractInfo($src);
-        my ($date, $y, $m, $d) = date($exif);
+        my ($date, $y, $m, $d) = exif_date($exif);
         my $rot = $rotation || exif_rotate($exif) || 0;
         my ($pw, $ph) = @{ $config{'preview-size'} };
         ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
         my $dst = mkpreview($y, $m, $d, $fid);
-        if ($thumb && $thumb ne $dst && -e $thumb) {
-            unlink $thumb;
-            print STDERR "D $fid $thumb\n";
+        if ($preview && $preview ne $dst && -e $preview) {
+            unlink $preview;
+            print STDERR "D $fid $preview\n";
         }
         if (-e $dst) {
             if (!$force) {
@@ -243,11 +237,11 @@ sub cmd_thumb {
             $dst,
             'fid' => $fid,
             'rotate' => $rot,
-            'master' => $hash,
+            'master' => $md5,
         );
         if (!$list) {
-            open $list, '>>', 'thumbs.list'
-                or die "Can't open thumb list: $!";
+            open $list, '>>', 'preview.list'
+                or fatal "open preview.list: $!";
         }
         print $list "$fid $dst\n";
         print STDERR "+ $fid $dst\n" if $verbose;
@@ -282,7 +276,22 @@ sub cmd_render {
     }
 }
 
+sub cmd_tail {
+    my $sth = sth('tail', <<'EOS');
+SELECT id FROM photos ORDER BY id DESC LIMIT ?
+EOS
+    my $n = @ARGV ? shift @ARGV : 10;
+    $sth->execute($n) or fatal $sth->errstr;
+    my @tail;
+    while (my ($id) = $sth->fetchrow_array) {
+        unshift @tail, $id;
+    }
+    print fid($_), "\n" for @tail;
+}
+
 # --- Other functions
+
+sub fid { sprintf '%05d', shift }
 
 sub mkpreview {
     my ($y, $m, $d, $fid) = @_;
@@ -294,7 +303,7 @@ sub create_preview {
     my ($pw, $ph) = @{ $config{'preview-size'} };
     my $rot = $arg{'rotate'} || 0;
     ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
-    my $magick = magick($src);
+    my $magick = $arg{'magick'} || magick($src);
     # my ($w, $h) = $magick->Get('width', 'height');
     render($magick, $dst,
         'strip' => 1,
@@ -332,6 +341,16 @@ sub init {
     use_plugins();
     fatal "can't determine root" if !defined $config{root};
     chdir($config{root}) or fatal "chdir $config{root}: $!";
+    open_sqlite3_db();
+}
+
+sub open_sqlite3_db {
+    $dbh = DBI->connect(sprintf('dbi:SQLite:dbname=%s', $dbfile), '', '');
+}
+
+sub sth {
+    my ($key, $sql) = @_;
+    return $sth{$key} ||= $dbh->prepare($sql);
 }
 
 sub db {
@@ -341,6 +360,17 @@ sub db {
         'path' => 'db/photos.db',
         'mode' => $mode,
     );
+}
+
+sub insert {
+    my ($photo) = @_;
+    my $sth = sth('insert', <<'EOS');
+INSERT OR REPLACE
+INTO photos
+        ( id, md5, taken, width, height, rotate )
+VALUES  ( ?,  ?,   ?,     ?,     ?,      ?      )
+EOS
+    $sth->execute(@$photo{qw(id md5 taken width height rotate)});
 }
 
 sub run_command {
@@ -374,17 +404,16 @@ sub mkcopy {
     return $fb;
 }
 
-sub hash {
+sub md5 {
     my ($f) = @_;
     open my $fh, '<', $f or die "Can't open file $f for reading: $!";
-    my $digest = Digest->new('MD5');
     $digest->addfile($fh);
     return $digest->hexdigest;
 }
 
 sub exif {
     my $exif = Image::ExifTool->new;
-    $exif->Options('DateFormat' => '%Y-%m-%d', 'StrictDate' => 1);
+    $exif->Options('DateFormat' => '%Y%m%dT%H%M%S', 'StrictDate' => 1);
     return $exif;
 }
 
@@ -407,30 +436,21 @@ sub exif_rotate {
     return 0;
 }
 
-sub date {
+sub exif_date {
     my ($exif) = @_;
-    my @date;
+    my ($date, @date) = qw(19700101T000000 1970 01 01 00 00 00);
     foreach (qw(CreateDate DateTimeOriginal FileModifyDate)) {
-        @date = parse_date($exif->GetValue($_));
-        if ($date[0] ne '19700101') {
-            return wantarray ? @date : $date[0];
+        my $rawdate = $exif->GetValue($_) or next;
+        if ($rawdate =~ /^(\d\d\d\d)(\d\d)(\d\d)T(\d\d)(\d\d)(\d\d)$/ && $1 gt '1970') {
+            ($date, @date) = ($rawdate, $1, $2, $3, $4, $5, $6);
+            last;
         }
     }
-    return wantarray ? @date[0..3] : $date[0];
-}
-
-sub parse_date {
-    my ($date) = @_;
-    return qw(19700101 1970 01 01) if !defined $date;
-    if ($date =~ /^(\d\d\d\d)[-:.]?(\d\d)[-:.]?(\d\d)/) {
-        $date = "$1$2$3";
-        return ($date, $1, $2, $3) if $date ge MINDATE;
-    }
-    return MINDATE, substr(MINDATE,0,4), substr(MINDATE,4,2), substr(MINDATE,6,2);
+    return wantarray ? ($date, @date) : $date;
 }
 
 sub use_plugins {
-    foreach my $f (grep { -x && -f _ } glob('lib/f4*.pl')) {
+    foreach my $f (grep { -x && -f _ } glob('lib/f5*.pl')) {
         if (!do $f) {
             my $err = $@ || $! || 'false return value';
             die "Can't use plugin $_: $err\n";
@@ -450,4 +470,29 @@ sub read_config {
     }
 }
 
+sub read_master_list {
+    open my $list, '<', 'masters.list'
+        or fatal "open masters.list: $!";
+    my %photo;
+    while (<$list>) {
+        my ($fid, $md5) = ( /^(\d+) (\S+)/ );
+        $photo{$fid} = $md5;
+    }
+    close $list;
+    return \%photo;
+}
 
+sub read_preview_list {
+    open my $log, '<', 'preview.list'
+        or fatal "open preview.list: $!";
+    my %preview;
+    while (<$log>) {
+        my ($fid, $file) = ( /^(\d+) (\S+)/ );
+        $preview{$fid} = $file;
+    }
+    close $log;
+    return \%preview;
+}
+
+sub init_sql {
+}
