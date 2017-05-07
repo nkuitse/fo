@@ -186,8 +186,9 @@ sub cmd_import {
         }
         elsif (-d _) {
             fatal "not a plain file: $f" if !$recurse;
-            my @f = grep { /\.jpg/i || -d $_ } glob("$f/*");
-            unshift @ARGV, @f if @f;
+            my @f = grep { /\.jpg$/i || -d $_ } glob("$f/*");
+            print(STDERR "skipping empty directory: $f\n"), next if !@f;
+            unshift @ARGV, @f;
         }
         elsif ($f !~ /\.jpg$/i) {
             fatal "not a JPEG: $f";
