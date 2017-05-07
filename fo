@@ -171,11 +171,11 @@ sub cmd_import {
     my $exif = exif();
     my $today = strftime('%Y%m%d', localtime);
     open my $log, '>>', mkfile('log', 'import.log')
-        or die "Can't open import log: $!";
+        or fatal "Can't open import log: $!";
     open my $list, '>>', 'masters.list'
-        or die "Can't open masters.list: $!";
+        or fatal "Can't open masters.list: $!";
     open my $thlist, '>>', 'preview.list'
-        or die "Can't open preview list: $!";
+        or fatal "Can't open preview list: $!";
     foreach my $f (@ARGV) {
         # Check to see if it's already been imported
         my $md5 = md5($f);
@@ -321,7 +321,7 @@ sub cmd_render {
     ) or usage;
     $size = size($size);
     my ($pw, $ph);
-    die "Not yet implemented";
+    fatal "Not yet implemented";
     usage if !@ARGV;
     expand(@ARGV);
     foreach my $fid (@ARGV) {
@@ -480,21 +480,21 @@ sub mkpath {
         $dir{$d}++
             or -d $d
             or mkdir $d
-            or die "Can't mkdir $d: $!";
+            or fatal "Can't mkdir $d: $!";
     }
     pop @paths;
 }
 
 sub xcopy {
     my ($fa, $fb, $mode) = @_;
-    move($fa, $fb) or copy($fa, $fb) or die "Can't copy $fa to $fb: $!";
+    move($fa, $fb) or copy($fa, $fb) or fatal "Can't copy $fa to $fb: $!";
     chmod($mode, $fb) if defined $mode;
     return $fb;
 }
 
 sub md5 {
     my ($f) = @_;
-    open my $fh, '<', $f or die "Can't open file $f for reading: $!";
+    open my $fh, '<', $f or fatal "Can't open file $f for reading: $!";
     $digest->addfile($fh);
     return $digest->hexdigest;
 }
@@ -541,7 +541,7 @@ sub use_plugins {
     foreach my $f (grep { -x && -f _ } glob('lib/f5*.pl')) {
         if (!do $f) {
             my $err = $@ || $! || 'false return value';
-            die "Can't use plugin $_: $err\n";
+            fatal "Can't use plugin $_: $err\n";
         }
     }
 }
@@ -593,5 +593,25 @@ sub geometry {
     $mg ||= magick($f);
     my ($w, $h) = $mg->Get(qw(width height));
     return ($w, $h, $r);
+}
+
+sub usage {
+    print <<'EOS';
+usage: fo COMMAND [ARG...]
+commands:
+  check FILE...
+  import FILE...
+  last [NUM]
+  ls [-lh] PHOTO...
+  master PHOTO...
+  preview PHOTO...
+  view PHOTO...
+EOS
+    exit 1;
+}
+
+sub fatal {
+    print STDERR "fo: @_\n";
+    exit 2;
 }
 
