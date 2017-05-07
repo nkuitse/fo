@@ -103,23 +103,11 @@ sub cmd_view {
         'm|master' => \$view_master,
     ) or usage;
     usage if !@ARGV;
-    my $db = db('r');
     my @cmd = shellwords($config{'viewer'});
-    my ($previews, $masters);
     foreach my $id (@ARGV) {
-        my $fid = fid($id);
-        if ($view_master) {
-            $masters ||= read_master_list();
-            my $md5 = $masters->{$fid};
-            fatal "no such photo: $fid" if !defined $md5;
-            push @cmd, master($md5);
-        }
-        else {
-            $previews ||= read_preview_list();
-            my $preview = $previews->{$fid}
-                or fatal "no preview for $fid";
-            push @cmd, $preview;
-        }
+        my $photo = photo($id)
+            or fatal "no such photo: $id";
+        push @cmd, $preview ? mkpreview($photo) : master($photo);
     }
     system(@cmd) == 0 or fatal "$cmd[0] failed: $!";
 }
@@ -381,6 +369,10 @@ sub ymd {
 sub fid { sprintf '%05d', shift }
 
 sub mkpreview {
+    if (@_ == 1 && ref $_[0]) {
+        my $photo = shift;
+        unshift @_, ymd($photo->{'taken'}), fid($photo->{'id'});
+    }
     my ($y, $m, $d, $fid) = @_;
     return mkfile('preview', "$y-$m", "$d-$fid.jpg"),
 }
@@ -403,14 +395,13 @@ sub create_preview {
 sub prefix { substr(shift, 0, 2) }
 
 sub master {
-    my ($fid) = @_;
-    my $pfx = prefix($fid);
-    return "masters/$pfx/$fid.jpg";
-}
-
-sub mkmeta {
-    my %meta = @_;
-    return join("\n", map { join(':', $key2code{$_}, $meta{$_}) } sort keys %meta);
+    if (@_ == 1 && ref $_[0]) {
+        my $photo = shift;
+        unshift @_, fid($photo->{'md5'});
+    }
+    my ($md5) = @_;
+    my $pfx = prefix($md5);
+    return "masters/$pfx/$md5.jpg";
 }
 
 sub render {
