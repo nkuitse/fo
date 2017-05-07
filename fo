@@ -180,7 +180,8 @@ sub cmd_import {
         or fatal "Can't open masters.list: $!";
     open my $thlist, '>>', 'preview.list'
         or fatal "Can't open preview list: $!";
-    foreach my $f (@ARGV) {
+    while (@ARGV) {
+        my $f = shift @ARGV;
         if (!-e $f) {
             fatal "no such file: $f";
         }
@@ -189,6 +190,7 @@ sub cmd_import {
             my @f = grep { /\.jpg$/i || -d $_ } glob("$f/*");
             print(STDERR "skipping empty directory: $f\n"), next if !@f;
             unshift @ARGV, @f;
+            next;
         }
         elsif ($f !~ /\.jpg$/i) {
             fatal "not a JPEG: $f";
