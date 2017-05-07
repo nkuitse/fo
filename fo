@@ -161,6 +161,10 @@ sub cmd_check {
 }
 
 sub cmd_import {
+    my ($recurse);
+    GetOptions(
+        'r' => \$recurse,
+    ) or usage;
     @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
         if !@ARGV;
     if (!@ARGV) {
@@ -177,6 +181,17 @@ sub cmd_import {
     open my $thlist, '>>', 'preview.list'
         or fatal "Can't open preview list: $!";
     foreach my $f (@ARGV) {
+        if (!-e $f) {
+            fatal "no such file: $f";
+        }
+        elsif (-d _) {
+            fatal "not a plain file: $f" if !$recurse;
+            my @f = grep { /\.jpg/i || -d $_ } glob("$f/*");
+            unshift @ARGV, @f if @f;
+        }
+        elsif ($f !~ /\.jpg$/i) {
+            fatal "not a JPEG: $f";
+        }
         # Check to see if it's already been imported
         my $md5 = md5($f);
         my $fid;
