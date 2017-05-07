@@ -397,7 +397,7 @@ sub prefix { substr(shift, 0, 2) }
 sub master {
     if (@_ == 1 && ref $_[0]) {
         my $photo = shift;
-        unshift @_, fid($photo->{'md5'});
+        unshift @_, $photo->{'md5'};
     }
     my ($md5) = @_;
     my $pfx = prefix($md5);
