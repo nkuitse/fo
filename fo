@@ -178,7 +178,7 @@ sub cmd_import {
         or fatal "Can't open import log: $!";
     open my $list, '>>', 'masters.list'
         or fatal "Can't open masters.list: $!";
-    open my $thlist, '>>', 'preview.list'
+    open my $prlist, '>>', 'preview.list'
         or fatal "Can't open preview list: $!";
     while (@ARGV) {
         my $f = shift @ARGV;
@@ -235,7 +235,7 @@ sub cmd_import {
             'master' => $md5,
             'magick' => $magick,
         );
-        print $list "$fid $dst\n";
+        print $prlist "$fid $dst\n";
 ####### # Add to DB
 ####### insert({
 #######     'id' => $fid,
@@ -278,7 +278,12 @@ sub cmd_preview {
     if ($list) {
         foreach (@photos) {
             my ($fid, $photo, $preview, $md5) = @$_;
-            print !$photo ? "? $fid\n" : !(-e $preview) ? "- $fid $preview\n" : "+ $fid $preview\n";
+            if ($photo && -e $preview) {
+                print $quiet ? "$preview\n" : "+ $fid $preview\n";
+            }
+            else {
+                print STDERR !$photo ? "? $fid\n" : "- $fid $preview\n";
+            }
         }
     }
     elsif ($check) {
@@ -286,7 +291,7 @@ sub cmd_preview {
         foreach (@photos) {
             my ($fid, $photo, $preview, $md5) = @$_;
             if ($preview && -e $preview) {
-                print "+ $fid $preview\n" if $verbose;
+                print STDERR "+ $fid $preview\n" if $verbose;
                 next;
             }
             print STDERR !$fid ? "? $fid\n" : !$preview ? "? $fid\n" : "- $fid $preview\n"
