@@ -37,16 +37,65 @@ my %config = (
     'viewer' => 'sxiv',
 );
 
-usage if !@ARGV;
+@ARGV = qw(ls) if !@ARGV;
 
 my $dbfile = 'db/photos.sqlite3';
 my ($dbh, %sth);
 my $digest = Digest->new('MD5');
 
 init();
-run_command();
+&{ __PACKAGE__->can('cmd_' . shift @ARGV) or usage };
 
 # --- Command handlers
+
+sub cmd_ls {
+    my ($long, $head);
+    GetOptions(
+        'l' => \$long,
+        'h' => \$head,
+    ) or usage;
+    my $sth;
+    if (@ARGV) {
+        $sth = sth(sprintf('SELECT id, md5, taken, width, height, rotate FROM photos WHERE id IN ( %s ) ORDER BY id', join(',', @ARGV)));
+    }
+    else {
+        $sth = sth('all', 'SELECT id, md5, taken, width, height, rotate FROM photos ORDER BY id');
+    }
+    $sth->execute;
+    while (my ($id, $md5, $taken, $width, $height, $rotate) = $sth->fetchrow_array) {
+        if (defined $head) {
+            if ($long) {
+                printf "%-5.5s %-32.32s %-15.15s %4.4s %4.4s %4.4s\n", qw(fid md5 date wdth hght rot);
+            }
+            else {
+                printf "%-5.5s %-8.8s\n", qw(fid date);
+            }
+            undef $head;
+        }
+        if ($long) {
+            printf "%05d %s %s %4d %4d %+4d\n", $id, $md5, $taken, $width || 0, $height || 0, $rotate || 0;
+        }
+        else {
+            printf "%05d %-8.8s\n", $id, $taken;
+        }
+    }
+}
+
+sub cmd_master {
+    my $masters = read_master_list();
+    foreach my $id (@ARGV) {
+        my $photo = photo($id+0);
+        my $md5 = $photo->{'md5'};
+        my $master = master($md5);
+        if (-e $master) {
+            print $master, "\n";
+        }
+        else {
+            my $fid = fid($id);
+            print "- $fid\n";
+        }
+    }
+}
 
 sub cmd_view {
     my ($view_master);
@@ -57,7 +106,8 @@ sub cmd_view {
     my $db = db('r');
     my @cmd = shellwords($config{'viewer'});
     my ($previews, $masters);
-    foreach my $fid (@ARGV) {
+    foreach my $id (@ARGV) {
+        my $fid = fid($id);
         if ($view_master) {
             $masters ||= read_master_list();
             my $md5 = $masters->{$fid};
@@ -117,7 +167,7 @@ sub cmd_import {
         print STDERR "nothing to import\n";
         exit 0;
     }
-    my $db = db('rw');
+### my $db = db('rw');
     my $exif = exif();
     my $today = strftime('%Y%m%d', localtime);
     open my $log, '>>', mkfile('log', 'import.log')
@@ -129,49 +179,54 @@ sub cmd_import {
     foreach my $f (@ARGV) {
         # Check to see if it's already been imported
         my $md5 = md5($f);
-        my $fid = eval { $db->get($md5) };
-        if (defined $fid) {
+        my $fid;
+        my $photo = photo($md5);
+        if (defined $photo) {
+            $fid = fid($photo->{'id'});
             print STDERR "- $fid $md5 $f :: already present\n";
             next;
         }
-        # Get the photo ID and record the MD5 hash
+        # Determine the date and dimensions
         $exif->ExtractInfo($f);
-        my $rot = exif_rotate($exif);
+        my $r = exif_rotate($exif);
         my ($date, $y, $m, $d, $H, $M, $S) = exif_date($exif);
         my $ymd = $y.$m.$d;
-        $fid = $db->mint('%N5d', mkmeta(
-            'created' => $ymd,
-            'imported' => $today,
-            'file' => $f,
-            'rotate' => $rot,
-        ));
-        $db->uset($md5 => $fid);
+        my $magick = magick($f);
+        my ($w, $h) = $magick->Get(qw(width height));
         # Write the master
         my $master = mkfile('masters', prefix($md5), "$md5.jpg");
-        mkcopy($f, $master, 0444);
+        xcopy($f, $master, 0444);
+        # Get the photo ID and record the MD5 hash
+        $fid = insert({
+            'md5' => $md5,
+            'taken' => $date,
+            'width' => $w,
+            'height' => $h,
+            'rotate' => $r,
+        });
         print $list "$fid $md5\n";
-        my $magick = magick($master);
-        my ($w, $h) = $magick->Get(qw(width height));
+####### $fid = $db->mint('%N5d', $md5);
+####### $db->uset($md5 => $fid);
         # Write the derived preview
         my $dst = mkpreview($y, $m, $d, $fid);
         create_preview(
             $master,
             $dst,
             'fid' => $fid,
-            'rotate' => $rot,
+            'rotate' => $r,
             'master' => $md5,
             'magick' => $magick,
         );
         print $list "$fid $dst\n";
-        # Add to DB
-        insert(
-            'id' => $fid,
-            'md5' => $md5,
-            'taken' => $date,
-            'width' => $w,
-            'height' => $h,
-            'rotate' => $rot,
-        );
+####### # Add to DB
+####### insert({
+#######     'id' => $fid,
+#######     'md5' => $md5,
+#######     'taken' => $date,
+#######     'width' => $w,
+#######     'height' => $h,
+#######     'rotate' => $r,
+####### });
         # Log it
         print $log "$today $fid $md5 $f\n";
         print STDERR "+ $fid $md5 $y $m $d $f\n";
@@ -179,77 +234,82 @@ sub cmd_import {
 }
 
 sub cmd_preview {
-    my ($force, $check, $verbose, $rotation);
+    my ($list, $null, $force, $check, $verbose, $quiet, $rotation);
     GetOptions(
+        'l' => \$list,
+        'n' => \$null,
         'f|force' => \$force,
         'k|check' => \$check,
         'v|verbose' => \$verbose,
+        'q|quiet' => \$quiet,
         'r|rotation=s' => \$rotation,
     ) or usage;
     usage if $check && $force;
-    my $exif = exif();
-    my $db = db('r');
-    my $previews = read_preview_list();
-    my $masters = read_master_list();
-    my $list;
-    foreach my $fid (@ARGV) {
-        my $md5 = $masters->{$fid};
-        if (!defined $md5) {
-            print STDERR "E $fid : unknown fid\n";
+    my @photos;
+    foreach my $id (@ARGV) {
+        my $fid = fid($id);
+        my $photo = photo($id);
+        if (!defined $photo) {
+            push @photos, [$fid];
             next;
         }
-        my $preview = $previews->{$fid};
-        if ($preview && -e $preview && !$force) {
-            if ($check) {
-                print $fid, ' ' if $verbose;
-                print $preview, "\n";
-                $check++;
-            }
-            else {
-                print STDERR "- $fid : preview already exists\n";
-            }
-            next;
+        my $taken = $photo->{'taken'};
+        my $preview = mkpreview(ymd($taken), $fid);
+        push @photos, [$fid, $photo, $preview, $photo->{'md5'}];
+    }
+    if ($list) {
+        foreach (@photos) {
+            my ($fid, $photo, $preview, $md5) = @$_;
+            print !$photo ? "? $fid\n" : !(-e $preview) ? "- $fid $preview\n" : "+ $fid $preview\n";
         }
-        my $src = master($md5);
-        if (!-e $src) {
-            print STDERR "E $fid : no master\n";
-            next;
-        }
-        $exif->ExtractInfo($src);
-        my ($date, $y, $m, $d) = exif_date($exif);
-        my $rot = $rotation || exif_rotate($exif) || 0;
-        my ($pw, $ph) = @{ $config{'preview-size'} };
-        ($pw, $ph) = ($ph, $pw) if abs($rot) == 90;
-        my $dst = mkpreview($y, $m, $d, $fid);
-        if ($preview && $preview ne $dst && -e $preview) {
-            unlink $preview;
-            print STDERR "D $fid $preview\n";
-        }
-        if (-e $dst) {
-            if (!$force) {
-                print STDERR "- $fid $dst\n";
+    }
+    elsif ($check) {
+        my $err = 0;
+        foreach (@photos) {
+            my ($fid, $photo, $preview, $md5) = @$_;
+            if ($preview && -e $preview) {
+                print "+ $fid $preview\n" if $verbose;
                 next;
             }
-            print STDERR "* $fid $dst\n";
+            print STDERR !$fid ? "? $fid\n" : !$preview ? "? $fid\n" : "- $fid $preview\n"
+                if !$quiet;
+            $err++;
         }
-        create_preview(
-            $src,
-            $dst,
-            'fid' => $fid,
-            'rotate' => $rot,
-            'master' => $md5,
-        );
-        if (!$list) {
-            open $list, '>>', 'preview.list'
-                or fatal "open preview.list: $!";
-        }
-        print $list "$fid $dst\n";
-        print STDERR "+ $fid $dst\n" if $verbose;
+        exit $err;
     }
-    if ($check) {
-        exit 0 if $check > @ARGV;
-        fatal "some not found" if $verbose;
-        exit 2;
+    else {
+        my $old_previews = read_preview_list();
+        open $list, '>>', 'preview.list'
+            or fatal "open preview.list: $!";
+        foreach (@photos) {
+            my ($fid, $photo, $preview, $md5) = @$_;
+            print(STDERR "? $fid\n"), next if !$fid;
+            my $master = master($md5);
+            print(STDERR "! $fid : no master\n"), next if !$master || !-e $master;
+            if (-e $preview) {
+                if (!$force) {
+                    print(STDERR ". $fid $preview\n"), next if $verbose;
+                    next;
+                }
+                unlink $preview or fatal "unlink $preview: $!";
+            }
+            my $old_preview = $old_previews->{$fid};
+            my ($taken, $r) = @$photo{qw(taken rotate)};
+            my ($pw, $ph) = @{ $config{'preview-size'} };
+            ($pw, $ph) = ($ph, $pw) if abs($r) == 90;
+            create_preview(
+                $master,
+                $preview,
+                'fid' => $fid,
+                'rotate' => $r,
+                'master' => $md5,
+            );
+            if ($old_preview && $old_preview ne $preview && -e $old_preview) {
+                unlink $old_preview or fatal "unlink $old_preview: $!";
+            }
+            print $list "$fid $preview\n";
+            print STDERR "+ $fid $preview\n" if $verbose;
+        }
     }
 }
 
@@ -276,20 +336,24 @@ sub cmd_render {
     }
 }
 
-sub cmd_tail {
-    my $sth = sth('tail', <<'EOS');
-SELECT id FROM photos ORDER BY id DESC LIMIT ?
-EOS
+sub cmd_last {
+    my $sth = sth('tail', 'SELECT id FROM photos ORDER BY id DESC LIMIT ?');
     my $n = @ARGV ? shift @ARGV : 10;
     $sth->execute($n) or fatal $sth->errstr;
-    my @tail;
+    my @recent;
     while (my ($id) = $sth->fetchrow_array) {
-        unshift @tail, $id;
+        unshift @recent, $id;
     }
-    print fid($_), "\n" for @tail;
+    print fid($_), "\n" for @recent;
 }
 
 # --- Other functions
+
+sub ymd {
+    my ($date) = @_;
+    return ($1, $2, $3) if $date =~ /^(\d\d\d\d)-?(\d\d)-?(\d\d)/;
+    fatal "unparseable date: $date";
+}
 
 sub fid { sprintf '%05d', shift }
 
@@ -349,8 +413,14 @@ sub open_sqlite3_db {
 }
 
 sub sth {
-    my ($key, $sql) = @_;
-    return $sth{$key} ||= $dbh->prepare($sql);
+    my $sql = pop;
+    if (@_) {
+        my $key = shift;
+        return $sth{$key} ||= $dbh->prepare($sql);
+    }
+    else {
+        return $dbh->prepare($sql);
+    }
 }
 
 sub db {
@@ -370,11 +440,29 @@ INTO photos
         ( id, md5, taken, width, height, rotate )
 VALUES  ( ?,  ?,   ?,     ?,     ?,      ?      )
 EOS
-    $sth->execute(@$photo{qw(id md5 taken width height rotate)});
+    my ($id, $md5, $taken, $w, $h, $r) = @$photo{qw(id md5 taken width height rotate)};
+    $sth->execute($id, $md5, $taken, $w, $h, $r || 0)
+        or fatal "insert: ", $sth->errstr;;
+    return fid($dbh->last_insert_id('', '', '', ''));
 }
 
-sub run_command {
-    &{ __PACKAGE__->can('cmd_' . shift @ARGV) or usage };
+sub photo {
+    my ($k) = @_;
+    my $sth;
+    if ($k =~ /^\d{1,6}$/) {
+        $sth = sth('fid2photo', 'SELECT * FROM photos WHERE id = ?');
+    }
+    elsif ($k =~ /^[0-9a-f]{32}$/) {
+        $sth = sth('md52photo', 'SELECT * FROM photos WHERE md5 = ?');
+    }
+    elsif (0 && $k =~ /^\@\d/) {
+        $k =~ tr/0-9T//cd;
+        $sth = sth('date2photo', 'SELECT * FROM photos WHERE taken >= ?');
+    }
+    $sth->execute($k);
+    while (my $photo = $sth->fetchrow_hashref) {
+        return $photo;
+    }
 }
 
 sub mkfile {
@@ -397,7 +485,7 @@ sub mkpath {
     pop @paths;
 }
 
-sub mkcopy {
+sub xcopy {
     my ($fa, $fb, $mode) = @_;
     move($fa, $fb) or copy($fa, $fb) or die "Can't copy $fa to $fb: $!";
     chmod($mode, $fb) if defined $mode;
@@ -429,7 +517,7 @@ sub exif_rotate {
     my $orient = $exif->GetValue('Orientation', 'ValueConv');
     $exif->SetNewValue('Orientation#' => 1)
         if !defined $orient || $orient != 1;
-    return if !defined $orient;
+    return   0 if !defined $orient;
     return +90 if $orient == 6;
     return -90 if $orient == 8;
     return 180 if $orient == 3;
@@ -494,5 +582,16 @@ sub read_preview_list {
     return \%preview;
 }
 
-sub init_sql {
+sub geometry {
+    my ($f, $mg, $ex) = @_;
+    if (!defined $ex) {
+        $ex = exif();
+        $ex->ExtractInfo($f);
+    }
+    my $r = exif_rotate($ex);
+    my $date = exif_date($ex);
+    $mg ||= magick($f);
+    my ($w, $h) = $mg->Get(qw(width height));
+    return ($w, $h, $r);
 }
+
