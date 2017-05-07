@@ -107,7 +107,7 @@ sub cmd_view {
     foreach my $id (@ARGV) {
         my $photo = photo($id)
             or fatal "no such photo: $id";
-        push @cmd, $preview ? mkpreview($photo) : master($photo);
+        push @cmd, $view_master ? master($photo) : mkpreview($photo);
     }
     system(@cmd) == 0 or fatal "$cmd[0] failed: $!";
 }
