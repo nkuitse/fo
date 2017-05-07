@@ -239,6 +239,19 @@ sub cmd_import {
     }
 }
 
+sub cmd_find {
+    my ($find_master);
+    GetOptions(
+        'm' => \$find_master,
+    ) or usage;
+    usage if !@ARGV;
+    foreach my $id (@ARGV) {
+        my $photo = photo($id)
+            or fatal "no such photo: $id";
+        print(($find_master ? master($photo) : mkpreview($photo)), "\n");
+    }
+}
+
 sub cmd_preview {
     my ($list, $null, $force, $check, $verbose, $quiet, $rotation);
     GetOptions(
