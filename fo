@@ -229,7 +229,7 @@ sub cmd_import {
 ####### });
         # Log it
         print $log "$today $fid $md5 $f\n";
-        print STDERR "+ $fid $md5 $y $m $d $f\n";
+        print STDERR "+ $fid $md5 $date $f\n";
     }
 }
 
