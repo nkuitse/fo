@@ -153,7 +153,7 @@ sub cmd_import {
     GetOptions(
         'r' => \$recurse,
     ) or usage;
-    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+    @ARGV = grep { -f $_ } glob('cameras/*/inbox/*.jpg')
         if !@ARGV;
     if (!@ARGV) {
         print STDERR "nothing to import\n";
