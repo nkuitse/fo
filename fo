@@ -240,14 +240,16 @@ sub cmd_import {
 }
 
 sub cmd_find {
-    my ($find_master);
+    my ($find_master, $relative_paths);
     GetOptions(
         'm' => \$find_master,
+        'r' => \$relative_paths,
     ) or usage;
     usage if !@ARGV;
     foreach my $id (@ARGV) {
         my $photo = photo($id)
             or fatal "no such photo: $id";
+        print $config{'root'}, '/' if !$relative_paths;
         print(($find_master ? master($photo) : mkpreview($photo)), "\n");
     }
 }
