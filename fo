@@ -113,7 +113,7 @@ sub cmd_view {
 }
 
 sub cmd_check {
-    @ARGV = grep { /\.jpg$/i && -f } glob('source/*/import/*')
+    @ARGV = glob('cameras/*/inbox/*.jpg')
         if !@ARGV;
     my $db = db('rw');
     my $err = 0;
