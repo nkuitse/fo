@@ -82,17 +82,24 @@ sub cmd_ls {
 }
 
 sub cmd_master {
+    my ($long);
+    GetOptions(
+        'l|long' => \$long,
+    ) or usage;
     my $masters = read_master_list();
     foreach my $id (@ARGV) {
         my $photo = photo($id+0);
         my $md5 = $photo->{'md5'};
         my $master = master($md5);
-        if (-e $master) {
-            print $master, "\n";
-        }
-        else {
+        if (!-e $master) {
             my $fid = fid($id);
             print "- $fid\n";
+        }
+        elsif ($long) {
+            printf "%05d %s\n", $id, $master;
+        }
+        else {
+            print $master, "\n";
         }
     }
 }
